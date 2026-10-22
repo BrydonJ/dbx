@@ -17,7 +17,7 @@ use crate::sql_dialect::{
 };
 use crate::transfer::{
     generate_comment_ddl, generate_create_table_ddl, is_identity_column_extra,
-    is_postgres_generated_always_identity_extra, quote_postgres_string_literal,
+    is_postgres_generated_always_identity_extra, postgres_sequence_sync_statement,
     wrap_dameng_identity_insert_sql_for_table,
 };
 
@@ -997,6 +997,10 @@ fn generate_insert_sync_statements(
 /// Explicit inserts into serial/identity columns do not advance PostgreSQL sequences,
 /// so the next default value would collide with a synchronized row. Move each sequence
 /// past the column's current maximum once the inserts have run.
+///
+/// Shares the transfer pipeline's `setval` shape, so like pg_dump the reset can also
+/// move a sequence backward when it sits above the table maximum (ids that were
+/// allocated and later deleted).
 fn generate_sequence_reset_statements(
     options: &GenerateDataSyncSqlOptions<'_>,
     table: &str,
@@ -1009,14 +1013,7 @@ fn generate_sequence_reset_statements(
         .columns
         .iter()
         .filter(|column| is_postgres_sequence_backed_column(column_info_for(column_info, column)))
-        .map(|column| {
-            let quoted_column = quote_table_identifier(options.database_type, column);
-            format!(
-                "SELECT setval(pg_get_serial_sequence({}, {}), COALESCE((SELECT MAX({quoted_column}) FROM {table}), 0) + 1, false);",
-                quote_postgres_string_literal(table),
-                quote_postgres_string_literal(column),
-            )
-        })
+        .map(|column| format!("{};", postgres_sequence_sync_statement(table, column)))
         .collect()
 }
 
@@ -2060,7 +2057,7 @@ mod tests {
             preparation.sync_sql,
             [
                 "INSERT INTO \"public\".\"generated_column_sync_test\" (\"id\", \"quantity\") OVERRIDING SYSTEM VALUE VALUES (1, 2);",
-                "SELECT setval(pg_get_serial_sequence('\"public\".\"generated_column_sync_test\"', 'id'), COALESCE((SELECT MAX(\"id\") FROM \"public\".\"generated_column_sync_test\"), 0) + 1, false);",
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"generated_column_sync_test\"', 'id')::regclass, GREATEST(COALESCE(MAX(\"id\"::bigint), 0), 1), MAX(\"id\"::bigint) IS NOT NULL) FROM \"public\".\"generated_column_sync_test\";",
                 "UPDATE \"public\".\"generated_column_sync_test\" SET \"quantity\" = 3 WHERE \"id\" = 2;",
             ]
             .join("\n")
@@ -2092,9 +2089,42 @@ mod tests {
             preparation.sync_statements,
             vec![
                 "INSERT INTO \"public\".\"migration\" (\"id\", \"legacy_id\", \"name\") VALUES (5, 9, 'add_column');",
-                "SELECT setval(pg_get_serial_sequence('\"public\".\"migration\"', 'id'), COALESCE((SELECT MAX(\"id\") FROM \"public\".\"migration\"), 0) + 1, false);",
-                "SELECT setval(pg_get_serial_sequence('\"public\".\"migration\"', 'legacy_id'), COALESCE((SELECT MAX(\"legacy_id\") FROM \"public\".\"migration\"), 0) + 1, false);",
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"migration\"', 'id')::regclass, GREATEST(COALESCE(MAX(\"id\"::bigint), 0), 1), MAX(\"id\"::bigint) IS NOT NULL) FROM \"public\".\"migration\";",
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"migration\"', 'legacy_id')::regclass, GREATEST(COALESCE(MAX(\"legacy_id\"::bigint), 0), 1), MAX(\"legacy_id\"::bigint) IS NOT NULL) FROM \"public\".\"migration\";",
             ]
+        );
+    }
+
+    #[test]
+    fn postgres_sync_sequence_reset_casts_non_integer_columns_to_bigint() {
+        // A nextval-backed column does not have to be an integer column; without the
+        // ::bigint cast COALESCE(MAX(text), 0) fails to resolve types at run time.
+        let preparation = prepare_data_compare(DataComparePreparationOptions {
+            table_name: "legacy_shapes".to_string(),
+            schema: Some("public".to_string()),
+            columns: vec!["id".to_string(), "legacy_ref".to_string()],
+            key_columns: vec!["id".to_string()],
+            column_info: vec![
+                data_compare_column_with_extra("id", "integer", "serial"),
+                DataGridColumnInfo {
+                    column_default: Some("nextval('legacy_ref_seq'::regclass)::text".to_string()),
+                    ..data_compare_column("legacy_ref", "text")
+                },
+            ],
+            source_rows: vec![vec![json!(1), json!("7")]],
+            target_rows: Vec::new(),
+            database_type: Some(DatabaseType::Postgres),
+        })
+        .expect("data compare preparation should succeed");
+
+        let reset = preparation
+            .sync_statements
+            .iter()
+            .find(|statement| statement.contains("setval") && statement.contains("\"legacy_ref\""))
+            .expect("sequence reset for legacy_ref");
+        assert_eq!(
+            *reset,
+            "SELECT setval(pg_get_serial_sequence('\"public\".\"legacy_shapes\"', 'legacy_ref')::regclass, GREATEST(COALESCE(MAX(\"legacy_ref\"::bigint), 0), 1), MAX(\"legacy_ref\"::bigint) IS NOT NULL) FROM \"public\".\"legacy_shapes\";"
         );
     }
 
