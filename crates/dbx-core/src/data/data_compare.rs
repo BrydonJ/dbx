@@ -1294,7 +1294,11 @@ async fn fetch_compare_rows(
     expected_rows: u64,
 ) -> Result<Vec<Vec<Value>>, String> {
     if let Some(key_indexes) = keyset_key_indexes(database_type, columns, key_columns) {
-        let rows = fetch_compare_rows_by_key(
+        // A keyset page error (e.g. a key column whose rendered text literal does
+        // not implicitly cast in a `>` predicate, such as PostgreSQL money/bytea)
+        // falls back to offset paging instead of failing a compare that the
+        // offset path can still serve.
+        let rows = match fetch_compare_rows_by_key(
             state,
             connection_id,
             database,
@@ -1307,7 +1311,16 @@ async fn fetch_compare_rows(
             fetch_batch_size,
             row_budget,
         )
-        .await?;
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                log::warn!(
+                    "[data-compare:keyset-fallback] database_type={database_type:?} table={table_name} error={error}"
+                );
+                None
+            }
+        };
         if let Some(rows) = rows {
             let expected = expected_rows.min(row_budget as u64);
             if rows.len() as u64 == expected {
